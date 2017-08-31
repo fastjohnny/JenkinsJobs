@@ -1,0 +1,149 @@
+node {
+  deleteDir()
+  dir('Status') {
+    env.WORKSPACE = pwd()
+    env.KUBECONFIG_DIR = '/var/jenkins_home/.kube/config'
+    env.DEPLOYMENT_NAME = 'alfaapp'
+    def deplstatusStage = sh(script: "sudo /usr/local/bin/kubectl --kubeconfig=$KUBECONFIG_DIR --namespace=default get deployment $DEPLOYMENT_NAME", returnStatus: true)
+    def deplstatusProd = sh(script: "sudo /usr/local/bin/kubectl --kubeconfig=$KUBECONFIG_DIR --namespace=prod get deployment $DEPLOYMENT_NAME", returnStatus: true)
+    writeFile(file:'deploymentStage.status', text: "$deplstatusStage")
+    writeFile(file:'deploymentProd.status', text: "$deplstatusProd")
+  }
+}
+pipeline {
+  agent any
+     environment {
+        REGISTRY_URL = 'dr.dr.rancher.internal:5000'
+        APP_NAME = 'alfa'
+        GIT_URL = 'http://192.168.56.9:9181/root'
+        REGISTRY_USER = 'testuser'
+        REGISTRY_PASSWORD = 'testpassword'
+        REGISTRY_PORT = '5000'
+        KUBECONFIG_DIR = '/var/jenkins_home/.kube/config'
+        DEPLOYMENT_NAME = 'alfaapp'
+    }
+    options {
+      gitLabConnection('gitlab')
+    }
+    stages {
+      stage('Grab code') {
+        steps {
+          gitlabCommitStatus(name: "Grab code"){
+            dir('App') {
+              git(url: "$GIT_URL/App.git")
+              sh 'git branch -u origin/dev; git merge --no-commit -X master'
+            }
+            dir('K8S') {
+              git(url: "$GIT_URL/K8S.git")
+              sh 'git branch -u origin/dev; git merge --no-commit -X master'
+            }
+          }
+        }
+      }
+      stage('Build image and testing container') {
+        steps {
+          gitlabCommitStatus(name: "Build image and testing container") {
+            script {
+              dir('App') {
+                app = docker.build("$REGISTRY_URL/$APP_NAME")
+                app.inside {
+                    parallel (
+                     'Test Server' : {
+                        sh '/bin/echo test1'
+                     },
+                     'Test Sample Client' : {
+                        sh '/bin/echo test2'
+                     }
+                    )
+                }
+              }
+            }
+          }
+        }
+      }
+      stage('Pushing Docker Image') {
+        steps {
+          gitlabCommitStatus(name: "Pushing Docker Image") {
+            script {
+              sh "docker login -u $REGISTRY_USER -p $REGISTRY_PASSWORD $REGISTRY_URL"
+              app.push("$REGISTRY_PORT/$APP_NAME:build$BUILD_NUMBER")
+              sh "docker logout $REGISTRY_URL"
+            }
+          }
+        }
+      }
+      stage('Deploying App on K8S Staging')
+      {
+        steps {
+          gitlabCommitStatus(name: "Deploying App on K8S Staging"){
+            dir('Status'){
+              echo "checking existence of deployment $DEPLOYMENT_NAME in staging"
+              script {
+                retstatStage = readFile('deploymentStage.status')
+                println retstatStage
+              }
+            }
+            dir('K8S') {
+              sh "/bin/sed -i s/VERSION_DEPLOY/$BUILD_NUMBER/ deployment.yaml"
+              script {
+                if (retstatStage == '1') {
+                  echo "not existing"
+                  sh "sudo /usr/local/bin/kubectl --kubeconfig=$KUBECONFIG_DIR create -f deployment.yaml"
+                }
+                else { echo "Exists, Updating image"
+                  sh "sudo /usr/local/bin/kubectl --kubeconfig=$KUBECONFIG_DIR set image deployment/$DEPLOYMENT_NAME $APP_NAME=$REGISTRY_URL/$APP_NAME:build$BUILD_NUMBER"
+                  sh "sudo /usr/local/bin/kubectl --kubeconfig=$KUBECONFIG_DIR rollout status deployment/$DEPLOYMENT_NAME"
+                }
+              }
+            }
+          }
+        }
+      }
+      stage('Waiting for approvement') {
+        steps {
+            gitlabCommitStatus(name: "Waiting for approvement") {
+              timeout(time:2, unit:'DAYS') {
+                input message:'Approve deployment to K8S Prod?'
+              }
+            }
+        }
+      }
+      stage('Deploying App on K8S Production') {
+        steps {
+          gitlabCommitStatus(name: "Deploying App on K8S Production"){
+            dir('Status'){
+              echo "checking existence of $DEPLOYMENT_NAME deployment in production"
+              script {
+                retstatProd = readFile('deploymentProd.status')
+                println retstatProd
+              }
+            }
+            dir('K8S') {
+              echo "checking existence of $DEPLOYMENT_NAME deployment in production"
+              script {
+                if (retstatProd == '1') {
+                  echo "not existing"
+                  sh "sudo /usr/local/bin/kubectl --kubeconfig=$KUBECONFIG_DIR --namespace=prod create -f deployment.yaml"
+                }
+                else { echo "Exists, Updating image"
+                  sh "sudo /usr/local/bin/kubectl --kubeconfig=$KUBECONFIG_DIR --namespace=prod set image deployment/$DEPLOYMENT_NAME $APP_NAME=$REGISTRY_URL/$APP_NAME:build$BUILD_NUMBER"
+                  sh "sudo /usr/local/bin/kubectl --kubeconfig=$KUBECONFIG_DIR --namespace=prod rollout status deployment/$DEPLOYMENT_NAME"
+                }
+              }
+            }
+          }
+        }
+      }
+      stage('Tag image as latest') {
+        steps {
+          gitlabCommitStatus(name: "Tag image as latest"){
+            script {
+              sh 'docker login -u $REGISTRY_USER -p $REGISTRY_PASSWORD $REGISTRY_URL'
+              app.push('$REGISTRY_PORT/$APP_NAME:latest')
+              sh 'docker logout $REGISTRY_URL'
+            }
+          }
+        }
+      }
+    }
+}
